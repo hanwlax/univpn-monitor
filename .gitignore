@@ -1,0 +1,7 @@
+# Logs may contain private network information.
+*.log
+*.log.old
+*.log.*
+*.tmp
+.DS_Store
+Thumbs.db
