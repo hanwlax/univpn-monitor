@@ -3,7 +3,11 @@ param(
     [ValidatePattern('^[A-Za-z0-9._:-]*$')]
     [string]$ProbeHost = '',
     [ValidateRange(0, 65535)]
-    [int]$ProbePort = 0
+    [int]$ProbePort = 0,
+    [ValidatePattern('^[A-Za-z0-9._:-]*$')]
+    [string]$NetworkProbeHost = '',
+    [ValidateRange(1, 65535)]
+    [int]$NetworkProbePort = 443
 )
 
 Set-StrictMode -Version 2.0
@@ -30,13 +34,14 @@ Copy-Item -LiteralPath $sourceScript -Destination $targetScript -Force
 Copy-Item -LiteralPath $sourceLauncher -Destination $targetLauncher -Force
 
 $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetScript`" -LogPath `"$installDirectory\watcher.log`""
-if (-not [string]::IsNullOrWhiteSpace($ProbeHost)) {
-    $arguments += " -ProbeHost `"$ProbeHost`""
-    if ($ProbePort -gt 0) {
-        $arguments += " -ProbePort $ProbePort"
-    }
-}
+# 所有启动入口经守护读取同一配置，避免立即启动/补拉时丢失探测参数。
+@{
+    ProbeHost = $ProbeHost
+    ProbePort = $ProbePort
+    NetworkProbeHost = $NetworkProbeHost
+    NetworkProbePort = $NetworkProbePort
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $installDirectory 'settings.json') -Encoding UTF8
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetLauncher`" -WatchScript `"$targetScript`""
 
 # 旧版本使用任务计划；部分机器会拒绝以任务方式运行长驻 PowerShell 脚本。
 $legacyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -52,9 +57,8 @@ New-ItemProperty -Path $runKey -Name $runValueName -PropertyType String -Value $
 
 # 轻量守护任务只检查监控进程是否存在；任务自身立即退出，不直接操作 UniVPN。
 $launcherLog = Join-Path $installDirectory 'launcher.log'
-$cmdExe = [IO.Path]::Combine($env:SystemRoot, 'System32', 'cmd.exe')
-$watchdogArguments = '/d /c ' + $powerShellExe + ' -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ' + $targetLauncher + ' -WatchScript ' + $targetScript + ' -LogPath ' + $launcherLog
-$watchdogAction = New-ScheduledTaskAction -Execute $cmdExe -Argument $watchdogArguments
+$watchdogArguments = "$arguments -LogPath `"$launcherLog`""
+$watchdogAction = New-ScheduledTaskAction -Execute $powerShellExe -Argument $watchdogArguments
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -67,7 +71,7 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Silen
     Where-Object { $_.CommandLine -like "*$targetScript*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-& $targetLauncher
+& $targetLauncher -WatchScript $targetScript
 
 Write-Host 'UniVPN 自动重连监控已安装并启动。' -ForegroundColor Green
 Write-Host "登录启动项：$runValueName"

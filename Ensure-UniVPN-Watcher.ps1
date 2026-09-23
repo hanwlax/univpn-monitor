@@ -35,6 +35,22 @@ try {
     $watcherLog = Join-Path (Split-Path -Parent $WatchScript) 'watcher.log'
     $quote = [char]34
     $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File $quote$WatchScript$quote -LogPath $quote$watcherLog$quote"
+    $settingsPath = Join-Path (Split-Path -Parent $WatchScript) 'settings.json'
+    if (Test-Path -LiteralPath $settingsPath) {
+        $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+        foreach ($name in @('ProbeHost', 'NetworkProbeHost')) {
+            $value = [string]$settings.$name
+            if ($value -notmatch '^[A-Za-z0-9._:-]*$') { throw "配置中的 $name 格式不合法。" }
+            if (-not [string]::IsNullOrWhiteSpace($value)) { $arguments += " -$name $quote$value$quote" }
+        }
+        foreach ($name in @('ProbePort', 'NetworkProbePort')) {
+            $value = [int]$settings.$name
+            $minimum = 0
+            if ($name -eq 'NetworkProbePort') { $minimum = 1 }
+            if ($value -lt $minimum -or $value -gt 65535) { throw "配置中的 $name 超出范围。" }
+            $arguments += " -$name $value"
+        }
+    }
     Start-Process -FilePath $powerShellExe -ArgumentList $arguments -WindowStyle Hidden
     Write-LauncherLog '检测到监控进程缺失，已重新启动。'
     exit 0

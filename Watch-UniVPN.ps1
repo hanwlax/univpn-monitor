@@ -5,16 +5,21 @@ param(
     [ValidateRange(0, 65535)]
     [int]$ProbePort = 0,
     [ValidateRange(10, 3600)]
-    [int]$CheckIntervalSeconds = 30,
+    [int]$CheckIntervalSeconds = 10,
     [ValidateRange(1, 20)]
     [int]$FailureThreshold = 2,
     [ValidateRange(30, 1800)]
-    [int]$RecoveryObservationSeconds = 300,
-    [int[]]$RetryBackoffMinutes = @(5, 10, 20, 30),
+    [int]$RecoveryObservationSeconds = 60,
+    [int[]]$RetryBackoffMinutes = @(1, 2, 5, 10),
     [ValidateRange(1, 20)]
-    [int]$MaxRestartsPerHour = 3,
+    [int]$MaxRestartsPerHour = 6,
+    # 兼容旧调用；暂停时间现在由滚动一小时预算决定，此参数不再使用。
     [ValidateRange(5, 1440)]
     [int]$CircuitBreakerMinutes = 30,
+    [ValidatePattern('^[A-Za-z0-9._:-]*$')]
+    [string]$NetworkProbeHost = '',
+    [ValidateRange(1, 65535)]
+    [int]$NetworkProbePort = 443,
     [string]$ClientPath = 'C:\Program Files (x86)\UniVPN\UniVPN.exe',
     [string]$LogPath = "$env:LOCALAPPDATA\UniVPN-Reconnect\watcher.log"
 )
@@ -164,42 +169,49 @@ function Start-UniVpnClient {
     Start-Process -FilePath $ClientPath -WorkingDirectory (Split-Path -Parent $ClientPath)
 }
 
-function Wait-VpnRecovery {
-    param([Parameter(Mandatory = $true)][DateTime]$StartedAt)
-
-    $deadline = $StartedAt.AddSeconds($RecoveryObservationSeconds)
-    $nextProgressLog = (Get-Date).AddSeconds(60)
-
-    while ((Get-Date) -lt $deadline) {
-        $health = Get-VpnHealth
-        if ($health.Healthy) {
-            $elapsed = [int]((Get-Date) - $StartedAt).TotalSeconds
-            Write-Log "VPN 已恢复；耗时=${elapsed}s；$(Format-VpnHealth $health)。"
-            return $true
+# 只检查物理网卡，避免把 VPN/WSL 虚拟网卡误当作底层网络。
+function Get-NetworkHealth {
+    try {
+        $ready = @()
+        $allAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop)
+        $allRoutes = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop)
+        foreach ($adapter in @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object Status -eq 'Up')) {
+            $addresses = @($allAddresses | Where-Object {
+                $_.InterfaceIndex -eq $adapter.InterfaceIndex -and
+                $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*'
+            })
+            $routes = @($allRoutes | Where-Object {
+                $_.InterfaceIndex -eq $adapter.InterfaceIndex -and
+                $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.NextHop -ne '0.0.0.0'
+            })
+            if ($addresses.Count -gt 0 -and $routes.Count -gt 0) {
+                $ready += $adapter.Name
+            }
         }
-
-        if ((Get-Date) -ge $nextProgressLog) {
-            $remaining = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalSeconds)
-            Write-Log "恢复观察中；剩余约=${remaining}s；$(Format-VpnHealth $health)。"
-            $nextProgressLog = (Get-Date).AddSeconds(60)
+        if ($ready.Count -eq 0) {
+            return [PSCustomObject]@{ Ready = $false; Reason = '物理网卡尚未就绪（需要 Up、有效 IPv4 和默认路由）' }
         }
-
-        $remainingSeconds = [int]($deadline - (Get-Date)).TotalSeconds
-        if ($remainingSeconds -le 0) {
-            break
+        if (-not [string]::IsNullOrWhiteSpace($NetworkProbeHost)) {
+            # ConnectAsync 包含 DNS 解析；整体等待上限 3 秒。
+            $client = New-Object System.Net.Sockets.TcpClient
+            try {
+                $connect = $client.ConnectAsync($NetworkProbeHost, $NetworkProbePort)
+                if (-not $connect.Wait(3000) -or -not $client.Connected) {
+                    return [PSCustomObject]@{ Ready = $false; Reason = "底层入口不可达：$NetworkProbeHost`:$NetworkProbePort" }
+                }
+            }
+            finally { $client.Dispose() }
         }
-        Start-Sleep -Seconds ([Math]::Min($CheckIntervalSeconds, $remainingSeconds))
+        return [PSCustomObject]@{ Ready = $true; Reason = "底层网络就绪：$($ready -join ',')；入口探测=$NetworkProbeHost" }
     }
-
-    $finalHealth = Get-VpnHealth
-    Write-Log "本轮恢复观察超时；观察=${RecoveryObservationSeconds}s；$(Format-VpnHealth $finalHealth)。"
-    return $false
+    catch {
+        return [PSCustomObject]@{ Ready = $false; Reason = "底层网络检查失败：$($_.Exception.Message)" }
+    }
 }
 
 function Invoke-UniVpnRecovery {
     param([Parameter(Mandatory = $true)][int]$AttemptNumber)
 
-    $startedAt = Get-Date
     $healthBefore = Get-VpnHealth
     Write-Log "开始第 $AttemptNumber 轮恢复；$(Format-VpnHealth $healthBefore)；$(Get-NetworkContext)。"
 
@@ -216,7 +228,7 @@ function Invoke-UniVpnRecovery {
         Start-UniVpnClient
     }
 
-    return Wait-VpnRecovery -StartedAt $startedAt
+    # 观察由主循环执行，期间仍持续检测底层网络变化。
 }
 
 function Get-BackoffMinutes {
@@ -225,123 +237,116 @@ function Get-BackoffMinutes {
     return $RetryBackoffMinutes[$index]
 }
 
-$mutex = [System.Threading.Mutex]::new($false, 'Local\UniVPN-Reconnect-Watcher')
-$ownsMutex = $false
-
-try {
-    $ownsMutex = $mutex.WaitOne(0, $false)
-    if (-not $ownsMutex) {
-        Write-Log '已有一个监控实例在运行，本实例退出。'
-        exit 0
-    }
-
-    $backoffText = ($RetryBackoffMinutes -join ',')
-    Write-Log "监控启动：地址前缀=$VpnAddressPrefix；检查=${CheckIntervalSeconds}s；失败阈值=$FailureThreshold；恢复观察=${RecoveryObservationSeconds}s；退避=${backoffText}min；每小时最多重启=$MaxRestartsPerHour；熔断=${CircuitBreakerMinutes}min。"
-
+function Invoke-MonitorLoop {
     $failureCount = 0
-    $outageActive = $false
     $recoveryAttempt = 0
     $nextRecoveryAt = [DateTime]::MinValue
-    $circuitOpenUntil = [DateTime]::MinValue
+    $observationUntil = [DateTime]::MinValue
     $lastWaitingLog = [DateTime]::MinValue
+    $networkWasReady = $null
+    $readyCount = 0
+    $networkRecoveryPending = $false
     $restartHistory = New-Object 'System.Collections.Generic.List[datetime]'
 
     while ($true) {
+        $network = Get-NetworkHealth
         $health = Get-VpnHealth
         $now = Get-Date
+        if ($null -eq $networkWasReady -or $network.Ready -ne $networkWasReady) {
+            Write-Log "底层网络状态变化；Ready=$($network.Ready)；$($network.Reason)。"
+        }
+        if (-not $network.Ready) {
+            $readyCount = 0
+            $networkRecoveryPending = $true
+            $observationUntil = [DateTime]::MinValue
+        }
+        else { $readyCount++ }
+        $networkWasReady = $network.Ready
 
+        # 预算跨短暂恢复保留，避免网络抖动导致无限重启。
+        for ($i = $restartHistory.Count - 1; $i -ge 0; $i--) {
+            if (($now - $restartHistory[$i]).TotalHours -ge 1) { $restartHistory.RemoveAt($i) }
+        }
         if ($health.Healthy) {
-            if ($outageActive -or $failureCount -gt 0) {
-                Write-Log "VPN 健康检查恢复正常；$(Format-VpnHealth $health)；故障状态和退避计数已清零。"
-            }
+            if ($failureCount -gt 0) { Write-Log "VPN 健康检查恢复正常；$(Format-VpnHealth $health)。" }
             $failureCount = 0
-            $outageActive = $false
             $recoveryAttempt = 0
             $nextRecoveryAt = [DateTime]::MinValue
-            $circuitOpenUntil = [DateTime]::MinValue
-            $lastWaitingLog = [DateTime]::MinValue
-            $restartHistory.Clear()
+            $observationUntil = [DateTime]::MinValue
+            $networkRecoveryPending = $false
         }
         else {
             $failureCount++
             if ($failureCount -le $FailureThreshold) {
                 Write-Log "VPN 健康检查失败（$failureCount/$FailureThreshold）；$(Format-VpnHealth $health)。"
             }
-
-            if ($failureCount -ge $FailureThreshold) {
-                if (-not $outageActive) {
-                    $outageActive = $true
-                    $nextRecoveryAt = $now
-                    Write-Log "确认 VPN 断线，将立即执行首轮恢复；$(Format-VpnHealth $health)。"
+            if ($network.Ready -and $readyCount -ge 2 -and $networkRecoveryPending) {
+                # 两次网络就绪确认后取消旧退避，但不绕过每小时重启预算。
+                $nextRecoveryAt = $now
+                $recoveryAttempt = 0
+                $networkRecoveryPending = $false
+                Write-Log '底层网络已连续两次就绪，取消旧退避，优先恢复 VPN（仍受重启预算限制）。'
+            }
+            if (-not $network.Ready -or $readyCount -lt 2) {
+                if (($now - $lastWaitingLog).TotalSeconds -ge 60) {
+                    Write-Log "等待底层网络稳定，不重启 UniVPN，不消耗重启预算；$($network.Reason)。"
+                    $lastWaitingLog = $now
                 }
-
-                for ($i = $restartHistory.Count - 1; $i -ge 0; $i--) {
-                    if (($now - $restartHistory[$i]).TotalHours -ge 1) {
-                        $restartHistory.RemoveAt($i)
-                    }
+            }
+            elseif ($failureCount -ge $FailureThreshold) {
+                if ($observationUntil -ne [DateTime]::MinValue -and $now -ge $observationUntil) {
+                    $backoffMinutes = Get-BackoffMinutes -FailedAttemptNumber $recoveryAttempt
+                    $nextRecoveryAt = $now.AddMinutes($backoffMinutes)
+                    $observationUntil = [DateTime]::MinValue
+                    Write-Log "第 $recoveryAttempt 轮观察超时；退避=${backoffMinutes}min；下次最早尝试=$($nextRecoveryAt.ToString('yyyy-MM-dd HH:mm:ss'))。"
                 }
-
-                if ($now -lt $circuitOpenUntil) {
-                    if (($now - $lastWaitingLog).TotalMinutes -ge 5) {
-                        Write-Log "熔断中，不重启 UniVPN；恢复尝试时间=$($circuitOpenUntil.ToString('yyyy-MM-dd HH:mm:ss'))；$(Format-VpnHealth $health)。"
-                        $lastWaitingLog = $now
-                    }
-                }
-                elseif ($now -ge $nextRecoveryAt) {
+                if ($observationUntil -eq [DateTime]::MinValue -and $now -ge $nextRecoveryAt) {
                     if ($restartHistory.Count -ge $MaxRestartsPerHour) {
-                        $budgetAvailableAt = $restartHistory[0].AddHours(1)
-                        $minimumCircuitEnd = $now.AddMinutes($CircuitBreakerMinutes)
-                        if ($budgetAvailableAt -gt $minimumCircuitEnd) {
-                            $circuitOpenUntil = $budgetAvailableAt
-                        }
-                        else {
-                            $circuitOpenUntil = $minimumCircuitEnd
-                        }
-                        $nextRecoveryAt = $circuitOpenUntil
-                        $lastWaitingLog = [DateTime]::MinValue
-                        Write-Log "已达到每小时 $MaxRestartsPerHour 次重启预算，开启熔断；下次最早尝试=$($circuitOpenUntil.ToString('yyyy-MM-dd HH:mm:ss'))。"
+                        $nextRecoveryAt = $restartHistory[0].AddHours(1)
+                        # 到预算释放时重试，避免每次触顶都重新延长暂停。
+                        Write-Log "重启预算已用尽；下次最早尝试=$($nextRecoveryAt.ToString('yyyy-MM-dd HH:mm:ss'))。"
                     }
                     else {
                         $recoveryAttempt++
                         $restartHistory.Add($now)
-                        $recovered = $false
                         try {
-                            $recovered = Invoke-UniVpnRecovery -AttemptNumber $recoveryAttempt
+                            Invoke-UniVpnRecovery -AttemptNumber $recoveryAttempt
+                            $observationUntil = (Get-Date).AddSeconds($RecoveryObservationSeconds)
+                            Write-Log "恢复观察开始；窗口=${RecoveryObservationSeconds}s。"
                         }
                         catch {
-                            Write-Log "第 $recoveryAttempt 轮恢复异常：$($_.Exception.Message)"
-                        }
-
-                        if ($recovered) {
-                            $failureCount = 0
-                            $outageActive = $false
-                            $recoveryAttempt = 0
-                            $nextRecoveryAt = [DateTime]::MinValue
-                            $circuitOpenUntil = [DateTime]::MinValue
-                            $lastWaitingLog = [DateTime]::MinValue
-                            $restartHistory.Clear()
-                        }
-                        else {
-                            $backoffMinutes = Get-BackoffMinutes -FailedAttemptNumber $recoveryAttempt
-                            $nextRecoveryAt = (Get-Date).AddMinutes($backoffMinutes)
-                            $lastWaitingLog = [DateTime]::MinValue
-                            Write-Log "第 $recoveryAttempt 轮恢复失败；退避=${backoffMinutes}min；下次最早尝试=$($nextRecoveryAt.ToString('yyyy-MM-dd HH:mm:ss'))。"
+                            $nextRecoveryAt = (Get-Date).AddMinutes((Get-BackoffMinutes -FailedAttemptNumber $recoveryAttempt))
+                            Write-Log "第 $recoveryAttempt 轮恢复异常：$($_.Exception.Message)；下次最早尝试=$($nextRecoveryAt.ToString('yyyy-MM-dd HH:mm:ss'))。"
                         }
                     }
                 }
-                elseif (($now - $lastWaitingLog).TotalMinutes -ge 5) {
-                    Write-Log "等待退避结束；下次最早尝试=$($nextRecoveryAt.ToString('yyyy-MM-dd HH:mm:ss'))；$(Format-VpnHealth $health)。"
+                if (($now - $lastWaitingLog).TotalSeconds -ge 60) {
+                    if ($observationUntil -ne [DateTime]::MinValue) {
+                        Write-Log "恢复观察中；观察截止=$($observationUntil.ToString('yyyy-MM-dd HH:mm:ss'))；$(Format-VpnHealth $health)。"
+                    }
+                    else {
+                        Write-Log "等待重试；下次最早尝试=$($nextRecoveryAt.ToString('yyyy-MM-dd HH:mm:ss'))；$(Format-VpnHealth $health)。"
+                    }
                     $lastWaitingLog = $now
                 }
             }
         }
-
         Start-Sleep -Seconds $CheckIntervalSeconds
     }
 }
-finally {
-    if ($ownsMutex) {
-        $mutex.ReleaseMutex()
+
+$mutex = [System.Threading.Mutex]::new($false, 'Local\UniVPN-Reconnect-Watcher')
+$ownsMutex = $false
+try {
+    $ownsMutex = $mutex.WaitOne(0, $false)
+    if (-not $ownsMutex) {
+        Write-Log '已有一个监控实例在运行，本实例退出。'
+        exit 0
     }
+    Write-Log "监控启动：检查=${CheckIntervalSeconds}s；失败阈值=$FailureThreshold；恢复观察=${RecoveryObservationSeconds}s；退避=$($RetryBackoffMinutes -join ',')min；每小时最多重启=$MaxRestartsPerHour；底层入口=$NetworkProbeHost`:$NetworkProbePort；内网探测=$ProbeHost`:$ProbePort。"
+    Invoke-MonitorLoop
+}
+finally {
+    if ($ownsMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
 }

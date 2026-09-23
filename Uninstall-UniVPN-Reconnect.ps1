@@ -34,5 +34,7 @@ if (Test-Path -LiteralPath $installedLauncher) {
     Remove-Item -LiteralPath $installedLauncher -Force
 }
 
+Remove-Item -LiteralPath (Join-Path $installDirectory 'settings.json') -Force -ErrorAction SilentlyContinue
+
 Write-Host 'UniVPN 自动重连监控、登录启动项和守护任务已卸载；历史日志仍保留在：' -ForegroundColor Green
 Write-Host $installDirectory
